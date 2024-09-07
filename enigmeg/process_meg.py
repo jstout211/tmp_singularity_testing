@@ -32,12 +32,17 @@ from mne_bids import BIDSPath
 import functools
 from scipy.stats import zscore, trim_mean
 from mne.preprocessing import maxwell_filter
+from io import StringIO
 
 # Set tensorflow to use CPU
 # The import is performed in the sub-functions to delay the unsuppressable warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Define some MNE settings
+os.environ['MNE_3D_OPTION_ANTIALIAS'] = 'false' # necessary for headless operation
+
 
 # define some variables
 
@@ -55,7 +60,15 @@ flatmagthresh = 10e-15
 flatgradthresh = 10e-13
 std_thresh = 15
 
-logger=logging.getLogger()
+
+# Make a string buffer logger before establishing final log filename
+  
+global log_dir
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+buffer_logstream = StringIO('')
+ch = logging.StreamHandler(stream=buffer_logstream)
+logger.addHandler(ch)
 
 # Function to retrieve the subject/session specific logger
 
@@ -120,7 +133,19 @@ class process():
 # =============================================================================
 #         # Initialize variables and directories
 # =============================================================================
-
+        
+        # Establish subject level logger and flush string buffer into file
+        log_dir = f'{bids_root}/derivatives/ENIGMA_MEG/logs' 
+        if not op.exists(log_dir): os.makedirs(log_dir)
+        _buffer = None
+        global logger
+        if len(logger.handlers) > 0:
+            if hasattr(logger.handlers[0], 'stream.getvalue'):
+                _buffer = logger.handlers[0].stream.getvalue()
+        logger = get_subj_logger(subject, session, rest_tagname, run, log_dir)
+        if _buffer != None:
+            logger.info(_buffer)
+        
         self.subject=subject.replace('sub-','')  # Strip sub- if present
         self.session = session
         self.run = run
@@ -477,7 +502,7 @@ class process():
                 self.ct_sparse = ct_sparse_path
                 self.sss_cal = sss_cal_path         
                 
-                if (megin_ignore != 'motcorr'):
+                if (megin_ignore != True):
                 
                     # Check for and run the movement correction on the dataset
                     chpi_info = mne.chpi.get_chpi_info(self.raw_rest.info)
@@ -485,7 +510,7 @@ class process():
                         if len(chpi_info[0]) > 0:
                             self._movement_comp()
                 
-                if (megin_ignore == 'motcorr'):
+                else:
   
                     self._tsss()
                    
@@ -700,7 +725,7 @@ class process():
                               deriv_path=self.eroom_derivpath)
     
     @log                        # Process the anatomical MRI
-    def proc_mri(self, t1_override=None,redo_all=False):
+    def proc_mri(self, t1_override=None,redo_all=False,volume='T1',preflood=None, gcaatlas=True):
         
         # if not provided with a separate T1 MRI filename, extract it from the BIDSpath objects
         if t1_override is not None:
@@ -751,7 +776,10 @@ class process():
         if (not os.path.exists(watershed_check_path)) or (redo_all is True):
             mne.bem.make_watershed_bem(f'sub-{self.subject}',
                                        self.subjects_dir,
-                                       overwrite=True
+                                       overwrite=True, 
+                                       gcaatlas=gcaatlas,
+                                       volume=volume,
+                                       preflood=preflood,
                                        )
         if (not bem_fname.fpath.exists()) or (redo_all is True):
             bem = mne.make_bem_model(f'sub-{self.subject}', 
@@ -1285,7 +1313,10 @@ def assess_bads(raw_fname, vendor, is_eroom=False): # assess MEG data for bad ch
         # get the standard deviation for each channel, and the trimmed mean of the stds
         stdraw_megs = np.std(raw_check._data[megs,:],axis=1)
         stdraw_trimmedmean_megs = sp.stats.trim_mean(stdraw_megs,0.1)
-        flat_idx_megs = megs[np.where(stdraw_megs < stdraw_trimmedmean_megs/100)[0]]
+        # note the that the threshold here is different for non-CTF or MEGIN systems
+        # we empirically observed that flat channels in KIT scanners sometimes had
+        # significant noise resulting in a failure to detect the flat channel
+        flat_idx_megs = megs[np.where(stdraw_megs < stdraw_trimmedmean_megs/50)[0]]
         flats = []
         for flat in flat_idx_megs:
             flats.append(raw_check.info['ch_names'][flat]) 
@@ -1404,7 +1435,7 @@ def get_freq_idx(bands, freq_bins):
     ''' Get the frequency indexes'''
     output=[]
     for band in bands:
-        tmp = np.nonzero((band[0] < freq_bins) & (freq_bins < band[1]))[0]   ### <<<<<<<<<<<<< Should this be =<...
+        tmp = np.nonzero((band[0] < freq_bins) & (freq_bins < band[1]))[0]   
         output.append(tmp)
     return output
 
@@ -1413,8 +1444,8 @@ def get_freq_idx(bands, freq_bins):
 # =============================================================================
 
 def process_subject(subject, args):
-    logger = get_subj_logger(subject, args.session, args.rest_tag, args.run, log_dir)
-    logger.info('Initializing structure')
+    # logger = get_subj_logger(subject, args.session, args.rest_tag, args.run, log_dir)
+    # logger.info('Initializing structure')
     proc = process(subject=subject, 
             bids_root=args.bids_root, 
             deriv_root=None,
@@ -1519,7 +1550,7 @@ def parse_manual_ica_qa(self):
     return newdict
 
 #%%  Argparse
-if __name__=='__main__':
+def return_args():
     import argparse  
     parser = argparse.ArgumentParser()
     standardargs = parser.add_argument_group('Standard Inputs')
@@ -1622,23 +1653,27 @@ if __name__=='__main__':
                         )
     parser.add_argument('-megin_ignore',
                         help='''Flag can be set to ignore megin processing, i.e. motcorr''',
+                        action='store_true',
                         default=None)
                                    
     args = parser.parse_args()
-    
-    logger=logging.getLogger()
-    logging.basicConfig(level=logging.INFO)
-    
-    n_jobs = args.n_jobs  #extract this from the configuration file
-    os.environ['n_jobs'] = str(n_jobs)
-    
-    os.environ['MNE_3D_OPTION_ANTIALIAS'] = 'false' # necessary for headless operation
-    
     # print help if no arguments
     if len(sys.argv) == 1:
         parser.print_help()
         parser.exit(1) 
     
+    if not op.exists(args.bids_root):    # throw an error if the BIDS root directory doesn't exist
+        parser.print_help()
+        raise ValueError('Please specify a correct -bids_root')     
+    return args
+    
+
+def main():
+    args = return_args()
+    
+    n_jobs = args.n_jobs  
+    os.environ['n_jobs'] = str(n_jobs)
+        
     # set some defaults
     if args.run:
         if args.run.lower()=='none': args.run=None
@@ -1653,9 +1688,6 @@ if __name__=='__main__':
     else:
         bids_root=args.bids_root
         
-    if not op.exists(bids_root):    # throw an error if the BIDS root directory doesn't exist
-        parser.print_help()
-        raise ValueError('Please specify a correct -bids_root')     
     
     # To make file handling easier, even if there is another subjects directory, we'll create one in 
     # the BIDS derivatives/ folder and set up symbolic links there. 
@@ -1677,6 +1709,7 @@ if __name__=='__main__':
     # check and make sure all fsaverage files are present and download if not. 
     mne.datasets.fetch_fsaverage(op.join(bids_root,'derivatives/freesurfer/subjects/'))
     
+    global logger
     log_dir = f'{bids_root}/derivatives/ENIGMA_MEG/logs'
     if not os.path.isdir(os.path.join(bids_root,'derivatives/ENIGMA_MEG')):
         os.makedirs(os.path.join(bids_root,'derivatives/ENIGMA_MEG'))
@@ -1745,7 +1778,6 @@ if __name__=='__main__':
             # now that we've set up the symbolic links, we can now use the default subjects directory
             args.subjects_dir = default_dir
       
-        logger = get_subj_logger(args.subject, args.session,args.rest_tag, args.run, log_dir)
         logger.info(f'processing subject {args.subject} session {args.session}')
         
         if args.ica_manual_qa_prep:
@@ -1797,7 +1829,6 @@ if __name__=='__main__':
             session=str(row['ses'])
             run=str(row['run'])
 
-            logger = get_subj_logger(subject, session, args.rest_tag, run, log_dir)
             logger.info(f'processing subject {subject} session {session}')
                         
             if args.remove_old:
@@ -1828,7 +1859,8 @@ if __name__=='__main__':
                                        t1_override = row['mripath'],
                                        fs_ave_fids = False,
                                        check_paths = True,
-                                       do_dics = args.do_dics
+                                       do_dics = args.do_dics, 
+                                       megin_ignore = args.megin_ignore
                                        )
                 
                 process_subj.load_data()
@@ -1852,3 +1884,6 @@ if __name__=='__main__':
                     
                 else:    
                     process_subj.do_proc_allsteps()
+ 
+if __name__=='__main__':
+    main()
